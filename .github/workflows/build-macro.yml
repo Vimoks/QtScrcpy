@@ -14,11 +14,12 @@ jobs:
       - name: Rewrite submodule URL to HTTPS
         run: git config --global url."https://github.com/".insteadOf "git@github.com:"
 
-      # 固定拉取 v4.1.1 标签（与官方发布完全一致的源码基线），子模块自动对齐 9e388b8
-      - name: Checkout v4.1.1
+      # 签出你 fork 的 master：其基线就是官方 v4.1.1（同一 commit f6cbf0d），
+      # 且带着你上传的补丁文件；子模块自动对齐官方锁定的 9e388b8
+      - name: Checkout master (v4.1.1 baseline + patches)
         uses: actions/checkout@v4
         with:
-          ref: v4.1.1
+          ref: master
           fetch-depth: 0
           submodules: recursive
 
@@ -45,7 +46,7 @@ jobs:
           target: 'desktop'
           arch: 'win64_msvc2019_64'
 
-      # 定位 Qt 安装目录（兼容 install-qt-action 不同版本的默认路径），
+      # 定位 Qt 安装目录（兼容不同版本的 install-qt-action 默认路径），
       # 输出为 Windows 风格路径写入 ENV_QT_PATH，供官方构建脚本使用
       - name: Locate Qt install
         shell: bash
