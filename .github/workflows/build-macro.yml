@@ -1,0 +1,107 @@
+name: build-macro
+
+# 手动触发（Actions 页面点 Run workflow）
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-2022
+
+    steps:
+      # 关键一步：官方 .gitmodules 中子模块是 SSH 地址（git@github.com:...），
+      # fork 的 CI 环境没有 SSH 密钥，统一改写为 HTTPS 匿名拉取（公开仓库无需凭据）
+      - name: Rewrite submodule URL to HTTPS
+        run: git config --global url."https://github.com/".insteadOf "git@github.com:"
+
+      # 固定拉取 v4.1.1 标签（与官方发布完全一致的源码基线），子模块自动对齐 9e388b8
+      - name: Checkout v4.1.1
+        uses: actions/checkout@v4
+        with:
+          ref: v4.1.1
+          fetch-depth: 0
+          submodules: recursive
+
+      # 在 QtScrcpyCore（子模块）内打上宏功能补丁（含 6 项修复）
+      - name: Apply macro patch (QtScrcpyCore)
+        shell: bash
+        run: |
+          cd QtScrcpy/QtScrcpyCore
+          git apply --check ../../macro_full_fix.patch
+          git apply ../../macro_full_fix.patch
+
+      # 在主程序打上失焦钩子补丁（Alt+Tab 停止宏）
+      - name: Apply focus patch (UI)
+        shell: bash
+        run: |
+          git apply --check ui_focus_fix.patch
+          git apply ui_focus_fix.patch
+
+      # 安装与官方一致的 Qt 5.15.2 MSVC2019 x64（官方 windows.yml 同款）
+      - name: Install Qt 5.15.2 (MSVC2019 x64)
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: '5.15.2'
+          target: 'desktop'
+          arch: 'win64_msvc2019_64'
+
+      # 定位 Qt 安装目录（兼容 install-qt-action 不同版本的默认路径），
+      # 输出为 Windows 风格路径写入 ENV_QT_PATH，供官方构建脚本使用
+      - name: Locate Qt install
+        shell: bash
+        run: |
+          KIT_DIR=""
+          if [ -d "$GITHUB_WORKSPACE/Qt/5.15.2/msvc2019_64" ]; then
+            KIT_DIR="$GITHUB_WORKSPACE/Qt/5.15.2"
+          elif [ -d "$GITHUB_WORKSPACE/5.15.2/msvc2019_64" ]; then
+            KIT_DIR="$GITHUB_WORKSPACE/5.15.2"
+          else
+            echo "ERROR: Qt kit directory not found, listing workspace:"; ls "$GITHUB_WORKSPACE"; exit 1
+          fi
+          WIN_PATH=$(cygpath -w "$KIT_DIR")
+          echo "ENV_QT_PATH=$WIN_PATH" >> "$GITHUB_ENV"
+          echo "Qt root: $WIN_PATH"
+
+      - name: Verify Qt install path
+        shell: cmd
+        run: |
+          echo Qt root: %ENV_QT_PATH%
+          if not exist "%ENV_QT_PATH%\msvc2019_64\lib\cmake\Qt5" (
+            echo ERROR: Qt cmake config not found
+            exit /b 1
+          )
+          echo Qt cmake config OK
+
+      # 生成版本号文件（官方脚本，产物版本显示 4.1.1）
+      - name: Generate version file
+        shell: bash
+        run: python ci/generate-version.py
+
+      # 官方同款构建命令（VS2022 + MSVC2019 Qt 工具链）
+      - name: Build MSVC x64
+        shell: cmd
+        env:
+          ENV_VCVARSALL: 'C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat'
+        run: |
+          call ci\win\build_for_win.bat RelWithDebInfo x64
+          if errorlevel 1 exit /b 1
+
+      # 官方同款打包命令：产出完整可运行目录（exe + Qt/ffmpeg DLL + adb + keymap 等）
+      - name: Package
+        shell: cmd
+        env:
+          ENV_VCVARSALL: 'C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat'
+        run: |
+          call ci\win\publish_for_win.bat x64 ..\build\QtScrcpy-win-x64-v4.1.1-macro
+          if errorlevel 1 exit /b 1
+          copy macro_demo.json ci\build\QtScrcpy-win-x64-v4.1.1-macro\keymap\macro_demo.json
+
+      - name: Compress package
+        shell: powershell
+        run: Compress-Archive -Path ci\build\QtScrcpy-win-x64-v4.1.1-macro -DestinationPath ci\build\QtScrcpy-win-x64-v4.1.1-macro.zip
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: QtScrcpy-win-x64-v4.1.1-macro
+          path: ci\build\QtScrcpy-win-x64-v4.1.1-macro.zip
