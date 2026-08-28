@@ -46,18 +46,21 @@ jobs:
           target: 'desktop'
           arch: 'win64_msvc2019_64'
 
-      # 定位 Qt 安装目录（兼容不同版本的 install-qt-action 默认路径），
-      # 输出为 Windows 风格路径写入 ENV_QT_PATH，供官方构建脚本使用
+      # 定位 Qt 安装目录：优先直接读 install-qt-action 导出的 QT_ROOT_DIR 环境变量
+      # （实测 v4 会把 Qt 装到工作区上一级，写死候选路径会猜错）；
+      # 输出 Windows 风格路径写入 ENV_QT_PATH，供官方构建脚本使用
       - name: Locate Qt install
         shell: bash
         run: |
-          KIT_DIR=""
-          if [ -d "$GITHUB_WORKSPACE/Qt/5.15.2/msvc2019_64" ]; then
+          QT_POSIX="$(cygpath -u "${QT_ROOT_DIR:-}" 2>/dev/null || true)"
+          if [ -n "$QT_POSIX" ] && [ -d "$QT_POSIX" ]; then
+            KIT_DIR="$(dirname "$QT_POSIX")"
+          elif [ -d "$GITHUB_WORKSPACE/Qt/5.15.2/msvc2019_64" ]; then
             KIT_DIR="$GITHUB_WORKSPACE/Qt/5.15.2"
           elif [ -d "$GITHUB_WORKSPACE/5.15.2/msvc2019_64" ]; then
             KIT_DIR="$GITHUB_WORKSPACE/5.15.2"
           else
-            echo "ERROR: Qt kit directory not found, listing workspace:"; ls "$GITHUB_WORKSPACE"; exit 1
+            echo "ERROR: Qt kit not found. QT_ROOT_DIR=$QT_ROOT_DIR"; ls "$GITHUB_WORKSPACE"; exit 1
           fi
           WIN_PATH=$(cygpath -w "$KIT_DIR")
           echo "ENV_QT_PATH=$WIN_PATH" >> "$GITHUB_ENV"
