@@ -1,0 +1,604 @@
+diff --git a/include/QtScrcpyCore.h b/include/QtScrcpyCore.h
+index 1e67de1..5ed154b 100644
+--- a/include/QtScrcpyCore.h
++++ b/include/QtScrcpyCore.h
+@@ -147,6 +147,9 @@ public:
+ 
+     virtual void updateScript(QString script) = 0;
+     virtual bool isCurrentCustomKeymap() = 0;
++
++    // 宏按键扩展：停止所有宏（窗口失焦时由 UI 调用；默认空实现保持接口兼容）
++    virtual void stopAllMacros() {}
+ };
+ 
+ class IDeviceManage : public QObject {
+diff --git a/src/device/controller/controller.cpp b/src/device/controller/controller.cpp
+index 8d0a621..a7d1c81 100644
+--- a/src/device/controller/controller.cpp
++++ b/src/device/controller/controller.cpp
+@@ -66,6 +66,11 @@ void Controller::test(QRect rc)
+ void Controller::updateScript(QString gameScript)
+ {
+     if (m_inputConvert) {
++        // 宏按键扩展：切换脚本前停止宏并抬起滞留触点
++        InputConvertGame *convertGame = qobject_cast<InputConvertGame*>(m_inputConvert.data());
++        if (convertGame) {
++            convertGame->stopAllMacros();
++        }
+         delete m_inputConvert;
+     }
+     if (!gameScript.isEmpty()) {
+@@ -88,6 +93,15 @@ bool Controller::isCurrentCustomKeymap()
+     return m_inputConvert->isCurrentCustomKeymap();
+ }
+ 
++// 宏按键扩展：停止所有宏（定时器停转、抬起滞留触点、释放状态）
++void Controller::stopAllMacros()
++{
++    InputConvertGame *convertGame = qobject_cast<InputConvertGame*>(m_inputConvert.data());
++    if (convertGame) {
++        convertGame->stopAllMacros();
++    }
++}
++
+ void Controller::postBackOrScreenOn(bool down)
+ {
+     ControlMsg *controlMsg = new ControlMsg(ControlMsg::CMT_BACK_OR_SCREEN_ON);
+diff --git a/src/device/controller/controller.h b/src/device/controller/controller.h
+index f1b36a7..e4f51cd 100644
+--- a/src/device/controller/controller.h
++++ b/src/device/controller/controller.h
+@@ -53,6 +53,9 @@ public:
+     void wheelEvent(const QWheelEvent *from, const QSize &frameSize, const QSize &showSize);
+     void keyEvent(const QKeyEvent *from, const QSize &frameSize, const QSize &showSize);
+ 
++    // 宏按键扩展：停止所有宏（窗口失焦/设备断开/切换脚本时由上层调用）
++    void stopAllMacros();
++
+     // turn the screen on if it was off, press BACK otherwise
+     // If the screen is off, it is turned on only on down
+     void postBackOrScreenOn(bool down);
+diff --git a/src/device/controller/inputconvert/inputconvertgame.cpp b/src/device/controller/inputconvert/inputconvertgame.cpp
+index 49a0eaf..8ce8f0a 100644
+--- a/src/device/controller/inputconvert/inputconvertgame.cpp
++++ b/src/device/controller/inputconvert/inputconvertgame.cpp
+@@ -17,10 +17,56 @@ InputConvertGame::InputConvertGame(Controller *controller) : InputConvertNormal(
+     m_ctrlSteerWheel.delayData.timer = new QTimer(this);
+     m_ctrlSteerWheel.delayData.timer->setSingleShot(true);
+     connect(m_ctrlSteerWheel.delayData.timer, &QTimer::timeout, this, &InputConvertGame::onSteerWheelTimer);
++    // 宏状态改为按 key 动态创建，构造函数无需初始化
++}
++
++InputConvertGame::~InputConvertGame() {
++    // 析构阶段不再发送触摸事件（Controller 可能正在销毁）
++    stopAllMacros(false);
++}
++
++// 停止并清理所有宏状态（析构/设备断开/切换 keymap/窗口失焦时调用）
++void InputConvertGame::stopAllMacros(bool sendTouchUp) {
++    // 清理所有多点触控宏
++    for (auto it = m_macroMultiTouchStates.begin(); it != m_macroMultiTouchStates.end(); ++it) {
++        MacroMultiTouchState *st = it.value();
++        if (st) {
++            // 防御性钳制：count 赋值处已限制在 MULTI_TOUCH_MAX_NUM 内
++            const int bounded = qMin(st->count, MULTI_TOUCH_MAX_NUM);
++            for (int i = 0; i < bounded; i++) {
++                if (st->touchIds[i] >= 0) {
++                    if (sendTouchUp) {
++                        sendTouchUpEvent(st->touchIds[i], QPointF(0, 0));
++                    }
++                    m_multiTouchID[st->touchIds[i]] = 0;
++                    st->touchIds[i] = -1;
++                }
++            }
++            delete st;
++        }
++    }
++    m_macroMultiTouchStates.clear();
++    // 清理所有循环点击宏
++    for (auto it = m_macroLoopClickStates.begin(); it != m_macroLoopClickStates.end(); ++it) {
++        MacroLoopClickState *st = it.value();
++        if (st) {
++            if (st->timer) {
++                st->timer->stop();
++                delete st->timer;
++            }
++            if (st->touchId >= 0) {
++                if (sendTouchUp) {
++                    sendTouchUpEvent(st->touchId, st->pos);
++                }
++                m_multiTouchID[st->touchId] = 0;
++                st->touchId = -1;
++            }
++            delete st;
++        }
++    }
++    m_macroLoopClickStates.clear();
+ }
+ 
+-InputConvertGame::~InputConvertGame() {}
+-
+ void InputConvertGame::mouseEvent(const QMouseEvent *from, const QSize &frameSize, const QSize &showSize)
+ {
+     // 处理开关按键
+@@ -131,6 +177,14 @@ void InputConvertGame::keyEvent(const QKeyEvent *from, const QSize &frameSize, c
+             return;
+         case KeyMap::KMT_ANDROID_KEY:
+             processAndroidKey(node.data.androidKey.keyNode.androidKey, from);
++            return;
++        // ===== 宏按键扩展（新增事件分发）=====
++        case KeyMap::KMT_MACRO_MULTI_TOUCH:
++            processMacroMultiTouch(node, from);
++            return;
++        case KeyMap::KMT_MACRO_LOOP_CLICK:
++            processMacroLoopClick(node, from);
++            return;
+         default:
+             break;
+         }
+@@ -540,6 +594,156 @@ void InputConvertGame::processAndroidKey(AndroidKeycode androidKey, const QKeyEv
+     sendKeyEvent(action, androidKey);
+ }
+ 
++// ===== 宏按键扩展（按 key 独立状态实现，支持多宏并行）=====
++
++// 多点触控宏：按下时按 delay 依次让多个手指落下，抬起时全部抬起
++// 每个触发键有独立的 MacroMultiTouchState，互不影响
++void InputConvertGame::processMacroMultiTouch(const KeyMap::KeyMapNode &node, const QKeyEvent *from)
++{
++    int key = from->key();
++
++    if (QEvent::KeyPress == from->type()) {
++        // 若该 key 上一次的状态还在，先清理（防止连按残留）
++        MacroMultiTouchState *st = m_macroMultiTouchStates.value(key, nullptr);
++        if (st) {
++            const int bounded = qMin(st->count, MULTI_TOUCH_MAX_NUM);
++            for (int i = 0; i < bounded; i++) {
++                if (st->touchIds[i] >= 0) {
++                    sendTouchUpEvent(st->touchIds[i], QPointF(0, 0));
++                    m_multiTouchID[st->touchIds[i]] = 0;
++                    st->touchIds[i] = -1;
++                }
++            }
++            st->count = 0;
++        } else {
++            st = new MacroMultiTouchState();
++            m_macroMultiTouchStates.insert(key, st);
++        }
++        st->pressKey = key;
++        st->generation++;  // 新的一轮按下，作废上一轮未触发的 singleShot 回调
++
++        // 触点数量钳制到 MULTI_TOUCH_MAX_NUM，防止 touchIds 数组越界
++        const int total = node.data.macroMultiTouch.touchNodesCount;
++        const int count = qMin(total, MULTI_TOUCH_MAX_NUM);
++        if (total > MULTI_TOUCH_MAX_NUM) {
++            qWarning("macroMultiTouch: touchNodes=%d > MULTI_TOUCH_MAX_NUM=%d, truncated", total, MULTI_TOUCH_MAX_NUM);
++        }
++        st->count = count;
++        for (int i = 0; i < count; i++) {
++            int delay = node.data.macroMultiTouch.touchNodes[i].delay;
++            QPointF pos = node.data.macroMultiTouch.touchNodes[i].pos;
++            int slot = i;
++            // 用唯一伪 key 分配 touch id，避免与其它映射/宏冲突
++            // qint64 计算，防止大键码（>= 0x01000000）乘 1000 后 int 溢出
++            const qint64 pseudoKey = static_cast<qint64>(key) * 1000 + slot;
++            // 捕获状态指针 + 代数做身份校验：松开后快速再按（状态被替换/代数递增）时，
++            // 旧的 singleShot 不会误触发到新状态上
++            const int gen = st->generation;
++            MacroMultiTouchState *stPtr = st;
++            QTimer::singleShot(delay, this, [this, key, stPtr, gen, slot, pos, pseudoKey]() {
++                MacroMultiTouchState *s = m_macroMultiTouchStates.value(key, nullptr);
++                if (s != stPtr || s->generation != gen) return;  // 状态已删除或被新一轮按下替换
++                if (s->touchIds[slot] >= 0) return;  // 已落下或已取消
++                int id = attachTouchID(pseudoKey);
++                if (id < 0) {
++                    qWarning("macroMultiTouch: no free touch id, MULTI_TOUCH_MAX_NUM=%d", MULTI_TOUCH_MAX_NUM);
++                    return;
++                }
++                s->touchIds[slot] = id;
++                sendTouchDownEvent(id, pos);
++            });
++        }
++    } else if (QEvent::KeyRelease == from->type()) {
++        // 释放该 key 所有已落下的手指，并删除状态
++        MacroMultiTouchState *st = m_macroMultiTouchStates.value(key, nullptr);
++        if (st) {
++            const int bounded = qMin(st->count, MULTI_TOUCH_MAX_NUM);
++            for (int i = 0; i < bounded; i++) {
++                if (st->touchIds[i] >= 0) {
++                    sendTouchUpEvent(st->touchIds[i], QPointF(0, 0));
++                    m_multiTouchID[st->touchIds[i]] = 0;
++                    st->touchIds[i] = -1;
++                }
++            }
++            m_macroMultiTouchStates.remove(key);
++            delete st;
++        }
++        // 注意：未落下的（singleShot 还没触发的）在回调里检查 !s 会自动取消
++    }
++}
++
++// 按住循环点击宏：按下立即第1次点击 → delay → 第2次 → ... → 松开立即停
++// 每个触发键有独立的 MacroLoopClickState 和 timer，互不影响
++void InputConvertGame::processMacroLoopClick(const KeyMap::KeyMapNode &node, const QKeyEvent *from)
++{
++    int key = from->key();
++
++    if (QEvent::KeyPress == from->type()) {
++        // 若该 key 已在运行，先停止并复位（防止连按残留）
++        MacroLoopClickState *st = m_macroLoopClickStates.value(key, nullptr);
++        if (!st) {
++            st = new MacroLoopClickState();
++            st->timer = new QTimer(this);
++            st->timer->setSingleShot(false);  // 重复触发，实现循环
++            // 定时器回调只在状态创建时连接一次（状态删除时定时器随之销毁），
++            // 避免重复 KeyPress 造成重复连接、每 tick 多次触发
++            connect(st->timer, &QTimer::timeout, this, [this, key]() {
++                MacroLoopClickState *s = m_macroLoopClickStates.value(key, nullptr);
++                if (!s) return;  // 已被删除
++                // 瞬间点击：down + up 在同一回调内连续发送
++                if (s->touchId < 0) {
++                    s->touchId = attachTouchID(static_cast<qint64>(s->pressKey) * 1000);
++                    if (s->touchId < 0) {
++                        qWarning("macroLoopClick: no free touch id");
++                        return;
++                    }
++                }
++                sendTouchDownEvent(s->touchId, s->pos);
++                sendTouchUpEvent(s->touchId, s->pos);
++            });
++            m_macroLoopClickStates.insert(key, st);
++        }
++        // 停止旧定时器并抬起残留触点
++        st->timer->stop();
++        if (st->touchId >= 0) {
++            sendTouchUpEvent(st->touchId, st->pos);
++            m_multiTouchID[st->touchId] = 0;
++            st->touchId = -1;
++            st->touching = false;
++        }
++
++        st->pressKey = key;
++        st->pos = node.data.macroLoopClick.pos;
++        st->delay = node.data.macroLoopClick.delay;
++
++        // 立即触发第 1 次点击，然后按 delay 循环
++        // 触发第 1 次（与定时器回调逻辑一致：瞬间点击）
++        if (st->touchId < 0) {
++            st->touchId = attachTouchID(static_cast<qint64>(st->pressKey) * 1000);
++        }
++        if (st->touchId >= 0) {
++            sendTouchDownEvent(st->touchId, st->pos);
++            sendTouchUpEvent(st->touchId, st->pos);
++        }
++        st->timer->start(st->delay);
++    } else if (QEvent::KeyRelease == from->type()) {
++        // 松开立即停止该 key 的循环
++        MacroLoopClickState *st = m_macroLoopClickStates.value(key, nullptr);
++        if (st) {
++            st->timer->stop();
++            if (st->touchId >= 0) {
++                sendTouchUpEvent(st->touchId, st->pos);
++                m_multiTouchID[st->touchId] = 0;
++                st->touchId = -1;
++                st->touching = false;
++            }
++            m_macroLoopClickStates.remove(key);
++            delete st->timer;
++            delete st;
++        }
++    }
++}
++
+ // -------- mouse event --------
+ 
+ bool InputConvertGame::processMouseClick(const QMouseEvent *from)
+@@ -729,6 +933,8 @@ bool InputConvertGame::switchGameMap()
+     if (!m_gameMap) {
+         stopMouseMoveTimer();
+         mouseMoveStopTouch();
++        // 宏按键扩展：退出自定义按键模式时立即停止所有宏并抬起触点
++        stopAllMacros();
+     }
+ 
+     return m_gameMap;
+diff --git a/src/device/controller/inputconvert/inputconvertgame.h b/src/device/controller/inputconvert/inputconvertgame.h
+index a870edb..fa2d474 100644
+--- a/src/device/controller/inputconvert/inputconvertgame.h
++++ b/src/device/controller/inputconvert/inputconvertgame.h
+@@ -3,6 +3,8 @@
+ 
+ #include <QPointF>
+ #include <QQueue>
++#include <QHash>
++#include <QTimer>
+ 
+ #include "inputconvertnormal.h"
+ #include "keymap.h"
+@@ -22,6 +24,11 @@ public:
+ 
+     void loadKeyMap(const QString &json);
+ 
++    // ===== 宏按键扩展：停止并清理所有宏状态 =====
++    // sendTouchUp=true 时先抬起所有已落下的触点（设备在线场景）；
++    // 析构时传 false，避免在对象销毁过程中发送事件。
++    void stopAllMacros(bool sendTouchUp = true);
++
+ protected:
+     void updateSize(const QSize &frameSize, const QSize &showSize);
+     void sendTouchDownEvent(int id, QPointF pos);
+@@ -33,9 +40,10 @@ protected:
+     QPointF calcScreenAbsolutePos(QPointF relativePos);
+ 
+     // multi touch id
+-    int attachTouchID(int key);
+-    void detachTouchID(int key);
+-    int getTouchID(int key);
++    // 存储的 key 值可为宏伪键（qint64），真实 Qt 键码（int）自动提升，无行为变化
++    int attachTouchID(qint64 key);
++    void detachTouchID(qint64 key);
++    int getTouchID(qint64 key);
+ 
+     // steer wheel
+     void processSteerWheel(const KeyMap::KeyMapNode &node, const QKeyEvent *from);
+@@ -52,6 +60,12 @@ protected:
+     // android key
+     void processAndroidKey(AndroidKeycode androidKey, const QKeyEvent *from);
+ 
++    // ===== 宏按键扩展（新增处理方法）=====
++    // 多点触控宏：一个键触发多个手指按下，各自带延迟
++    void processMacroMultiTouch(const KeyMap::KeyMapNode &node, const QKeyEvent *from);
++    // 按住循环点击宏：按住时循环点击，松开立即停止
++    void processMacroLoopClick(const KeyMap::KeyMapNode &node, const QKeyEvent *from);
++
+     // mouse
+     bool processMouseClick(const QMouseEvent *from);
+     bool processMouseMove(const QMouseEvent *from);
+@@ -82,7 +96,7 @@ private:
+     QSize m_showSize;
+     bool m_gameMap = false;
+     bool m_needBackMouseMove = false;
+-    int m_multiTouchID[MULTI_TOUCH_MAX_NUM] = { 0 };
++    qint64 m_multiTouchID[MULTI_TOUCH_MAX_NUM] = { 0 };
+     KeyMap m_keyMap;
+ 
+     bool m_processMouseMove = true;
+@@ -126,6 +140,31 @@ private:
+         QQueue<quint32> queueTimer;
+         int pressKey = 0;
+     } m_dragDelayData;
++
++    // ===== 宏按键扩展（按 key 独立状态，支持多宏并行）=====
++    // 多点触控宏状态：每个触发键一个独立实例
++    struct MacroMultiTouchState {
++        int touchIds[MULTI_TOUCH_MAX_NUM]; // 各触点的 touch id（-1 表示未使用）
++        int count = 0;                     // 触点总数
++        int pressKey = 0;                  // 触发键
++        int generation = 0;                 // 按下代数：每次 KeyPress +1，用于丢弃过期的 singleShot 回调
++        MacroMultiTouchState() {
++            for (int i = 0; i < MULTI_TOUCH_MAX_NUM; i++) touchIds[i] = -1;
++        }
++    };
++    QHash<int, MacroMultiTouchState*> m_macroMultiTouchStates; // key → 状态
++
++    // 按住循环点击宏状态：每个触发键一个独立实例
++    struct MacroLoopClickState {
++        QTimer* timer = nullptr;           // 循环定时器（重复触发，独立）
++        int touchId = -1;                  // 当前使用的 touch id
++        int pressKey = 0;                  // 触发键
++        QPointF pos;                       // 点击位置
++        quint32 delay = 50;                // 循环间隔(ms)
++        bool touching = false;             // 当前是否处于按下状态
++    };
++    QHash<int, MacroLoopClickState*> m_macroLoopClickStates; // key → 状态
++
+ };
+ 
+ #endif // INPUTCONVERTGAME_H
+diff --git a/src/device/controller/inputconvert/keymap/keymap.cpp b/src/device/controller/inputconvert/keymap/keymap.cpp
+index a3bc1d4..e035f90 100644
+--- a/src/device/controller/inputconvert/keymap/keymap.cpp
++++ b/src/device/controller/inputconvert/keymap/keymap.cpp
+@@ -308,6 +308,55 @@ void KeyMap::loadKeyMap(const QString &json)
+                 keyMapNode.data.androidKey.keyNode.androidKey = static_cast<AndroidKeycode>(getItemDouble(node, "androidKey"));
+                 m_keyMapNodes.push_back(keyMapNode);
+             } break;
++            // ===== 宏按键扩展（新增解析逻辑）=====
++            case KeyMap::KMT_MACRO_MULTI_TOUCH: {
++                if (!checkForMacroMultiTouch(node)) {
++                    qWarning() << "json error: keyMapNodes node format error";
++                    break;
++                }
++                QPair<ActionType, int> key = getItemKey(node, "key");
++                if (key.first == AT_INVALID) {
++                    qWarning() << "json error: keyMapNodes node invalid key: " << node.value("key").toString();
++                    break;
++                }
++                KeyMapNode keyMapNode;
++                keyMapNode.type = type;
++                keyMapNode.data.macroMultiTouch.keyNode.type = key.first;
++                keyMapNode.data.macroMultiTouch.keyNode.key = key.second;
++                QJsonArray touchNodes = node.value("touchNodes").toArray();
++                keyMapNode.data.macroMultiTouch.touchNodesCount = 0;
++                for (int i = 0; i < touchNodes.size(); i++) {
++                    if (i >= MAX_DELAY_CLICK_NODES) {
++                        qInfo() << "touchNodes too much, up to" << MAX_DELAY_CLICK_NODES;
++                        break;
++                    }
++                    QJsonObject tn = touchNodes.at(i).toObject();
++                    keyMapNode.data.macroMultiTouch.touchNodes[i].delay =
++                        static_cast<int>(getItemDouble(tn, "delay"));
++                    keyMapNode.data.macroMultiTouch.touchNodes[i].pos = getItemPos(tn, "pos");
++                    keyMapNode.data.macroMultiTouch.touchNodesCount++;
++                }
++                m_keyMapNodes.push_back(keyMapNode);
++            } break;
++            case KeyMap::KMT_MACRO_LOOP_CLICK: {
++                if (!checkForMacroLoopClick(node)) {
++                    qWarning() << "json error: keyMapNodes node format error";
++                    break;
++                }
++                QPair<ActionType, int> key = getItemKey(node, "key");
++                if (key.first == AT_INVALID) {
++                    qWarning() << "json error: keyMapNodes node invalid key: " << node.value("key").toString();
++                    break;
++                }
++                KeyMapNode keyMapNode;
++                keyMapNode.type = type;
++                keyMapNode.data.macroLoopClick.keyNode.type = key.first;
++                keyMapNode.data.macroLoopClick.keyNode.key = key.second;
++                keyMapNode.data.macroLoopClick.pos = getItemPos(node, "pos");
++                keyMapNode.data.macroLoopClick.delay =
++                    node.contains("delay") ? static_cast<quint32>(getItemDouble(node, "delay")) : 50;
++                m_keyMapNodes.push_back(keyMapNode);
++            } break;
+             default:
+                 qWarning() << "json error: keyMapNodes invalid node type:" << node.value("type").toString();
+                 break;
+@@ -406,6 +455,15 @@ void KeyMap::makeReverseMap()
+             QMultiHash<int, KeyMapNode *> &m = node.data.androidKey.keyNode.type == AT_KEY ? m_rmapKey : m_rmapMouse;
+             m.insert(node.data.androidKey.keyNode.key, &node);
+         } break;
++        // ===== 宏按键扩展（新增反向映射）=====
++        case KMT_MACRO_MULTI_TOUCH: {
++            QMultiHash<int, KeyMapNode *> &m = node.data.macroMultiTouch.keyNode.type == AT_KEY ? m_rmapKey : m_rmapMouse;
++            m.insert(node.data.macroMultiTouch.keyNode.key, &node);
++        } break;
++        case KMT_MACRO_LOOP_CLICK: {
++            QMultiHash<int, KeyMapNode *> &m = node.data.macroLoopClick.keyNode.type == AT_KEY ? m_rmapKey : m_rmapMouse;
++            m.insert(node.data.macroLoopClick.keyNode.key, &node);
++        } break;
+         default:
+             break;
+         }
+@@ -552,3 +610,35 @@ bool KeyMap::checkForDrag(const QJsonObject &node)
+ {
+     return checkItemString(node, "key") && checkItemPos(node, "startPos") && checkItemPos(node, "endPos");
+ }
++
++// ===== 宏按键扩展（新增校验函数实现）=====
++bool KeyMap::checkForMacroMultiTouch(const QJsonObject &node)
++{
++    if (!checkItemString(node, "key")) {
++        return false;
++    }
++    if (!node.contains("touchNodes") || !node.value("touchNodes").isArray()) {
++        qWarning("json error: macroMultiTouch no find touchNodes array");
++        return false;
++    }
++    QJsonArray touchNodes = node.value("touchNodes").toArray();
++    if (touchNodes.isEmpty()) {
++        qWarning("json error: macroMultiTouch touchNodes is empty");
++        return false;
++    }
++    for (int i = 0; i < touchNodes.size(); i++) {
++        if (!touchNodes.at(i).isObject()) {
++            return false;
++        }
++        QJsonObject tn = touchNodes.at(i).toObject();
++        if (!checkItemPos(tn, "pos") || !checkItemDouble(tn, "delay")) {
++            return false;
++        }
++    }
++    return true;
++}
++
++bool KeyMap::checkForMacroLoopClick(const QJsonObject &node)
++{
++    return checkItemString(node, "key") && checkItemPos(node, "pos");
++}
+diff --git a/src/device/controller/inputconvert/keymap/keymap.h b/src/device/controller/inputconvert/keymap/keymap.h
+index 0389ee5..ef76893 100644
+--- a/src/device/controller/inputconvert/keymap/keymap.h
++++ b/src/device/controller/inputconvert/keymap/keymap.h
+@@ -26,7 +26,10 @@ public:
+         KMT_STEER_WHEEL,
+         KMT_DRAG,
+         KMT_MOUSE_MOVE,
+-        KMT_ANDROID_KEY
++        KMT_ANDROID_KEY,
++        // ===== 宏按键扩展（新增）=====
++        KMT_MACRO_MULTI_TOUCH,   // 多点触控宏：一个键触发多个手指按下，各自带延迟
++        KMT_MACRO_LOOP_CLICK     // 按住循环点击宏：按住时循环点击，松开立即停止
+     };
+     Q_ENUM(KeyMapType)
+ 
+@@ -106,6 +109,21 @@ public:
+             {
+                 KeyNode keyNode;
+             } androidKey;
++            // ===== 宏按键扩展（新增数据结构）=====
++            // 多点触控宏：一个键触发多个手指按下
++            struct
++            {
++                KeyNode keyNode;
++                DelayClickNode touchNodes[MAX_DELAY_CLICK_NODES]; // 复用 DelayClickNode：delay + pos
++                int touchNodesCount = 0;
++            } macroMultiTouch;
++            // 按住循环点击宏：按住时循环点击，松开停止
++            struct
++            {
++                KeyNode keyNode;
++                QPointF pos = { 0.0, 0.0 };     // 点击位置
++                quint32 delay = 50;             // 循环间隔(ms)，两次点击之间的延迟
++            } macroLoopClick;
+             DATA() {}
+             ~DATA() {}
+         } data;
+@@ -147,6 +165,9 @@ private:
+     bool checkForSteerWhell(const QJsonObject &node);
+     bool checkForDrag(const QJsonObject &node);
+     bool checkForAndroidKey(const QJsonObject &node);
++    // ===== 宏按键扩展（新增校验函数）=====
++    bool checkForMacroMultiTouch(const QJsonObject &node);
++    bool checkForMacroLoopClick(const QJsonObject &node);
+ 
+     // get keymap from json object
+     QString getItemString(const QJsonObject &node, const QString &name);
+diff --git a/src/device/device.cpp b/src/device/device.cpp
+index 3a897fa..4fdcd59 100644
+--- a/src/device/device.cpp
++++ b/src/device/device.cpp
+@@ -440,6 +440,12 @@ void Device::disconnectDevice()
+     if (!m_server) {
+         return;
+     }
++
++    // 宏按键扩展：先停止所有宏（抬起滞留触点），再关闭服务
++    if (m_controller) {
++        m_controller->stopAllMacros();
++    }
++
+     m_server->stop();
+     m_server = Q_NULLPTR;
+ 
+@@ -839,6 +845,15 @@ void Device::keyEvent(const QKeyEvent *from, const QSize &frameSize, const QSize
+     }
+ }
+ 
++// 宏按键扩展：停止所有宏（窗口失焦/设备断开时由上层调用）
++void Device::stopAllMacros()
++{
++    if (!m_controller) {
++        return;
++    }
++    m_controller->stopAllMacros();
++}
++
+ bool Device::isCurrentCustomKeymap()
+ {
+     if (isCameraMode()) {
+diff --git a/src/device/device.h b/src/device/device.h
+index afb8189..c64ee57 100644
+--- a/src/device/device.h
++++ b/src/device/device.h
+@@ -82,6 +82,9 @@ public:
+     void updateScript(QString script) override;
+     bool isCurrentCustomKeymap() override;
+ 
++    // 宏按键扩展：停止所有宏（窗口失焦/设备断开时调用）
++    void stopAllMacros() override;
++
+ private:
+     void initSignals();
+     bool saveFrame(int width, int height, uint8_t* dataRGB32);
